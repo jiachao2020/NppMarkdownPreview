@@ -120,11 +120,13 @@ __PLUGIN_CSS__
                            this.parser.parse(token.tokens) + '</blockquote>';
                 },
                 list: function (token) {
+                    var items = '';
+                    for (var i = 0; i < token.items.length; i++) items += this.listitem(token.items[i]);
                     var tag = token.ordered ? 'ol' : 'ul';
-                    var start = (token.ordered && token.start !== 1 && token.start !== undefined)
-                              ? ' start="' + token.start + '"' : '';
-                    return '<' + tag + start + ' data-source-line="' + (token.__sl || 0) + '">' +
-                           this.parser.parse(token.items) + '</' + tag + '>';
+                    var start = (token.ordered && token.start !== '' && token.start !== 1 &&
+                                 token.start !== undefined) ? ' start="' + token.start + '"' : '';
+                    return '<' + tag + start + ' data-source-line="' + (token.__sl || 0) + '">\n' +
+                           items + '</' + tag + '>\n';
                 },
                 table: function (token) {
                     var h = '<table data-source-line="' + (token.__sl || 0) + '"><thead><tr>';
