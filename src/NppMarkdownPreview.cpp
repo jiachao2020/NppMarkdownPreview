@@ -23,7 +23,6 @@ static FuncItem g_funcItems[3] = {};
 
 static HWND g_panel = nullptr;
 static bool g_panelCreated = false;
-static bool g_panelVisible = false;
 
 static std::string g_lastMarkdown;
 static bool g_hintShown = false;
@@ -139,7 +138,8 @@ static bool GetCurrentMarkdown(std::string& out) {
 // ---------------------------------------------------------------------------
 
 static void ScheduleRefresh() {
-    if (g_panel && g_panelVisible) SetTimer(g_panel, TIMER_RENDER, 400, nullptr);
+    // ask the window system - the dock X button hides the panel without telling us
+    if (g_panel && IsWindowVisible(g_panel)) SetTimer(g_panel, TIMER_RENDER, 400, nullptr);
 }
 
 static void RenderNow() {
@@ -224,7 +224,6 @@ static void EnsurePanel() {
     SendMessageW(g_npp._nppHandle, NPPM_DMMREGASDCKDLG, 0, (LPARAM)&tb);
 
     g_panelCreated = true;
-    g_panelVisible = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -237,19 +236,17 @@ static void cmdTogglePreview() {
         ScheduleRefresh();
         return;
     }
-    if (g_panelVisible) {
+    if (IsWindowVisible(g_panel)) {
         SendMessageW(g_npp._nppHandle, NPPM_DMMHIDE, 0, (LPARAM)g_panel);
-        g_panelVisible = false;
     } else {
         SendMessageW(g_npp._nppHandle, NPPM_DMMSHOW, 0, (LPARAM)g_panel);
-        g_panelVisible = true;
         g_lastMarkdown.clear();   // force re-render
         ScheduleRefresh();
     }
 }
 
 static void cmdRefreshPreview() {
-    if (!g_panelCreated || !g_panelVisible) return;
+    if (!g_panelCreated || !IsWindowVisible(g_panel)) return;
     g_lastMarkdown.clear();
     RenderNow();
 }
