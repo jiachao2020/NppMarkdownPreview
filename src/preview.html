@@ -3,12 +3,14 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link id="__hljs_light" rel="stylesheet" href="http://nppmdp.local/github.min.css">
+<link id="__hljs_dark" rel="stylesheet" href="http://nppmdp.local/github-dark.min.css" disabled>
 <style>
 __PLUGIN_CSS__
 </style>
-<script>
-__PLUGIN_MARKED__
-</script>
+<script src="http://nppmdp.local/marked.umd.js"></script>
+<script src="http://nppmdp.local/highlight.min.js"></script>
+<script src="http://nppmdp.local/mermaid.min.js"></script>
 </head>
 <body>
 <div id="__status" class="status">Loading preview...</div>
@@ -18,25 +20,208 @@ __PLUGIN_MARKED__
     'use strict';
     var content = document.getElementById('__content');
     var status = document.getElementById('__status');
+    var hljsLight = document.getElementById('__hljs_light');
+    var hljsDark = document.getElementById('__hljs_dark');
+    var darkMQ = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+    var __programmaticScroll = 0;
+
     function fail(msg) {
         content.style.display = 'none';
         status.textContent = msg;
         status.style.display = 'block';
     }
-    if (typeof marked === 'undefined') {
-        fail('marked.js failed to load');
-        return;
+    function esc(s) {
+        return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }
+    function countNL(s) {
+        var n = 0, i = s.indexOf('\n');
+        while (i >= 0) { n++; i = s.indexOf('\n', i + 1); }
+        return n;
+    }
+
+    // ---- theme switching for hljs stylesheets ----
+    function applyTheme() {
+        var dark = darkMQ && darkMQ.matches;
+        if (hljsLight) hljsLight.disabled = !!dark;
+        if (hljsDark) hljsDark.disabled = !dark;
+    }
+    applyTheme();
+    if (darkMQ && darkMQ.addEventListener) darkMQ.addEventListener('change', function () { applyTheme(); });
+
+    // ---- mermaid ----
+    var mermaidReady = false;
+    if (window.mermaid) {
+        try {
+            mermaid.initialize({
+                startOnLoad: false,
+                securityLevel: 'strict',
+                theme: (darkMQ && darkMQ.matches) ? 'dark' : 'default'
+            });
+            mermaidReady = true;
+        } catch (e) { mermaidReady = false; }
+    }
+
+    // ---- marked: attach source-line numbers to block tokens ----
+    function tagTokens(tokens, startLine) {
+        var line = startLine;
+        for (var i = 0; i < tokens.length; i++) {
+            var t = tokens[i];
+            if (t.type === 'space') { line += countNL(t.raw); continue; }
+            t.__sl = line;
+            if (t.type === 'list' && t.items) {
+                var inner = line;
+                for (var j = 0; j < t.items.length; j++) {
+                    var it = t.items[j];
+                    it.__sl = inner;
+                    if (it.tokens) tagTokens(it.tokens, inner);
+                    inner += countNL(it.raw);
+                }
+            } else if (t.tokens) {
+                tagTokens(t.tokens, line);
+            }
+            line += countNL(t.raw);
+        }
+        return line;
+    }
+
+    function alAttr(a) {
+        return a ? ' style="text-align:' + a + '"' : '';
+    }
+
+    if (window.marked) {
+        marked.use({
+            gfm: true,
+            breaks: false,
+            renderer: {
+                heading: function (token) {
+                    return '<h' + token.depth + ' data-source-line="' + (token.__sl || 0) + '">' +
+                           this.parser.parseInline(token.tokens) + '</h' + token.depth + '>';
+                },
+                paragraph: function (token) {
+                    return '<p data-source-line="' + (token.__sl || 0) + '">' +
+                           this.parser.parseInline(token.tokens) + '</p>';
+                },
+                code: function (token) {
+                    var lang = (token.lang || '').trim().split(/\s+/)[0];
+                    var body;
+                    if (lang === 'mermaid') {
+                        body = esc(token.text);
+                    } else if (window.hljs && lang && hljs.getLanguage(lang)) {
+                        try { body = hljs.highlight(token.text, { language: lang, ignoreIllegals: true }).value; }
+                        catch (e) { body = esc(token.text); }
+                    } else {
+                        body = esc(token.text);
+                    }
+                    return '<pre data-source-line="' + (token.__sl || 0) + '"><code class="hljs' +
+                           (lang ? ' language-' + lang : '') + '">' + body + '</code></pre>';
+                },
+                blockquote: function (token) {
+                    return '<blockquote data-source-line="' + (token.__sl || 0) + '">' +
+                           this.parser.parse(token.tokens) + '</blockquote>';
+                },
+                list: function (token) {
+                    var tag = token.ordered ? 'ol' : 'ul';
+                    var start = (token.ordered && token.start !== 1 && token.start !== undefined)
+                              ? ' start="' + token.start + '"' : '';
+                    return '<' + tag + start + ' data-source-line="' + (token.__sl || 0) + '">' +
+                           this.parser.parse(token.items) + '</' + tag + '>';
+                },
+                table: function (token) {
+                    var h = '<table data-source-line="' + (token.__sl || 0) + '"><thead><tr>';
+                    for (var i = 0; i < token.header.length; i++) {
+                        var c = token.header[i];
+                        h += '<th' + alAttr(c.align) + '>' + this.parser.parseInline(c.tokens) + '</th>';
+                    }
+                    h += '</tr></thead><tbody>';
+                    for (var r = 0; r < token.rows.length; r++) {
+                        h += '<tr>';
+                        var row = token.rows[r];
+                        for (var k = 0; k < row.length; k++) {
+                            h += '<td' + alAttr(row[k].align) + '>' + this.parser.parseInline(row[k].tokens) + '</td>';
+                        }
+                        h += '</tr>';
+                    }
+                    return h + '</tbody></table>';
+                },
+                hr: function (token) {
+                    return '<hr data-source-line="' + (token.__sl || 0) + '">';
+                }
+            }
+        });
+    }
+
+    // ---- render ----
+    function renderMd(md) {
+        var tokens = marked.lexer(md);
+        tagTokens(tokens, 0);
+        content.innerHTML = marked.parser(tokens);
+        // mermaid: swap <pre><code class="language-mermaid"> for div.mermaid and render
+        if (mermaidReady) {
+            var blocks = content.querySelectorAll('pre code.language-mermaid');
+            if (blocks.length) {
+                for (var i = 0; i < blocks.length; i++) {
+                    var d = document.createElement('div');
+                    d.className = 'mermaid';
+                    d.textContent = blocks[i].textContent;
+                    blocks[i].parentNode.replaceWith(d);
+                }
+                try { mermaid.run({ querySelector: '.mermaid', suppressErrors: true }); } catch (e) { }
+            }
+        }
+    }
+
     window.__update = function (md) {
         try {
+            if (!window.marked) { fail('marked.js failed to load'); return; }
             status.style.display = 'none';
             content.style.display = 'block';
-            content.innerHTML = marked.parse(md);
+            renderMd(md);
         } catch (e) {
             fail('Render error: ' + (e && e.message ? e.message : String(e)));
         }
     };
     window.__setStatus = fail;
+
+    // ---- export hook: return rendered html ----
+    window.__getHtml = function () {
+        return content.style.display === 'none' ? '' : content.innerHTML;
+    };
+
+    // ---- scroll sync: preview -> editor ----
+    function topSourceLine() {
+        var els = content.querySelectorAll('[data-source-line]');
+        var top = window.scrollY + 24;
+        var best = 0;
+        for (var i = 0; i < els.length; i++) {
+            if (els[i].offsetTop <= top) best = +els[i].getAttribute('data-source-line');
+            else break;
+        }
+        return best;
+    }
+    var lastSend = 0;
+    window.addEventListener('scroll', function () {
+        if (__programmaticScroll) return;
+        var now = Date.now();
+        if (now - lastSend < 80) return;
+        lastSend = now;
+        try {
+            window.chrome.webview.postMessage('scroll:' + topSourceLine());
+        } catch (e) { }
+    }, { passive: true });
+
+    // ---- scroll sync: editor -> preview ----
+    window.__scrollToLine = function (line) {
+        var els = content.querySelectorAll('[data-source-line]');
+        var target = null;
+        for (var i = 0; i < els.length; i++) {
+            if (+els[i].getAttribute('data-source-line') <= line) target = els[i];
+            else break;
+        }
+        if (!target) return;
+        __programmaticScroll = 1;
+        window.scrollTo(0, Math.max(0, target.offsetTop - 8));
+        setTimeout(function () { __programmaticScroll = 0; }, 80);
+    };
 })();
 </script>
 </body>
