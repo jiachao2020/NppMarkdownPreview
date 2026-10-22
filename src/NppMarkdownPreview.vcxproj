@@ -64,6 +64,10 @@
     <None Include="preview.html" />
     <None Include="style.css" />
     <None Include="marked.umd.js" />
+    <None Include="highlight.min.js" />
+    <None Include="github.min.css" />
+    <None Include="github-dark.min.css" />
+    <None Include="mermaid.min.js" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4258.31" />
