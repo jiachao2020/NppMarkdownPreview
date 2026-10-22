@@ -44,6 +44,12 @@ public:
     }
 };
 
+inline std::wstring HexCode(HRESULT hr) {
+    wchar_t buf[16];
+    swprintf_s(buf, L"%08X", (unsigned)hr);
+    return buf;
+}
+
 class NavHandler final : public RefCounted<ICoreWebView2NavigationCompletedEventHandler> {
 public:
     HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2* /*sender*/,
@@ -68,7 +74,12 @@ public:
     std::wstring html;
 
     HRESULT STDMETHODCALLTYPE Invoke(HRESULT errorCode, ICoreWebView2Controller* createdController) override {
-        if (FAILED(errorCode) || !createdController) return S_OK;
+        if (FAILED(errorCode) || !createdController) {
+            MessageBoxW(parent,
+                        (L"WebView2 controller creation failed.\nHRESULT: 0x" + HexCode(errorCode)).c_str(),
+                        L"NppMarkdownPreview", MB_OK | MB_ICONWARNING);
+            return S_OK;
+        }
         g_controller = createdController;
         if (FAILED(g_controller->get_CoreWebView2(&g_webview)) || !g_webview) return S_OK;
 
@@ -93,9 +104,9 @@ public:
     HRESULT STDMETHODCALLTYPE Invoke(HRESULT errorCode, ICoreWebView2Environment* createdEnvironment) override {
         if (FAILED(errorCode) || !createdEnvironment) {
             MessageBoxW(parent,
-                        L"WebView2 runtime is not available on this system.\n\n"
-                        L"Please install the Microsoft Edge WebView2 Runtime (Evergreen)\n"
-                        L"and restart Notepad++.",
+                        (L"WebView2 runtime is not available.\nHRESULT: 0x" + HexCode(errorCode) +
+                        L"\n\nPlease install the Microsoft Edge WebView2 Runtime (Evergreen)\n"
+                        L"and restart Notepad++.").c_str(),
                         L"NppMarkdownPreview", MB_OK | MB_ICONWARNING);
             return S_OK;
         }
@@ -139,15 +150,23 @@ inline bool Init(HWND parent, const std::wstring& bootstrapHtml) {
 
     wchar_t localAppData[MAX_PATH] = {};
     GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH);
-    std::wstring userData = std::wstring(localAppData) + L"\\NppMarkdownPreview\\WebView2Cache";
-    CreateDirectoryW(userData.c_str(), nullptr);   // may already exist
+    std::wstring base = std::wstring(localAppData) + L"\\NppMarkdownPreview";
+    CreateDirectoryW(base.c_str(), nullptr);            // parent must exist,
+    std::wstring userData = base + L"\\WebView2Cache";  // WebView2 creates the leaf but not parents
+    CreateDirectoryW(userData.c_str(), nullptr);        // may already exist
 
     auto* eh = new EnvironmentHandler();
     eh->parent = parent;
     eh->html = bootstrapHtml;
     HRESULT hr = create(nullptr, userData.c_str(), nullptr, eh);
     eh->Release();
-    return SUCCEEDED(hr);
+    if (FAILED(hr)) {
+        MessageBoxW(parent,
+                    (L"CreateCoreWebView2Environment failed immediately.\nHRESULT: 0x" + HexCode(hr)).c_str(),
+                    L"NppMarkdownPreview", MB_OK | MB_ICONWARNING);
+        return false;
+    }
+    return true;
 }
 
 inline void Resize(const RECT& rc) {
