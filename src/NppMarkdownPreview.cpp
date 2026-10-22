@@ -1,31 +1,40 @@
 // NppMarkdownPreview.cpp - native Notepad++ markdown preview plugin (ARM64 / x64).
 //
 // Renders the current Markdown buffer in a dockable panel using WebView2
-// (Chromium/Edge) + marked.js. Pure Win32 + COM, no .NET, no ATL/MFC.
+// (Chromium/Edge) + marked.js, with highlight.js code highlighting and
+// Mermaid diagrams. Pure Win32 + COM, no .NET, no ATL/MFC.
 //
 // Plugin license: GPLv3 (interface headers vendored from the GPLv3 Notepad++ tree).
-// marked.js is MIT licensed.
+// marked.js / highlight.js: MIT   |   Mermaid: MIT
 
 #include <windows.h>
+#include <commdlg.h>
 #include <string>
 #include "PluginInterface.h"
 #include "Docking.h"
 #include "WebView2Preview.h"
 #include "resource.h"
 
-#define TIMER_RENDER   1
-#define MD_MAX_BYTES   (10 * 1024 * 1024)
+#pragma comment(lib, "comdlg32.lib")
+
+#define TIMER_RENDER      1
+#define TIMER_SCROLLSYNC  2
+#define MD_MAX_BYTES      (10 * 1024 * 1024)
 
 HINSTANCE g_hInst = nullptr;
 
 static NppData g_npp = {};
-static FuncItem g_funcItems[3] = {};
+static FuncItem g_funcItems[8] = {};
 
 static HWND g_panel = nullptr;
 static bool g_panelCreated = false;
 
 static std::string g_lastMarkdown;
 static bool g_hintShown = false;
+
+// scroll-sync state
+static bool g_syncingFromPreview = false;   // guards echo
+static DWORD g_lastEditorScrollTick = 0;
 
 // ---------------------------------------------------------------------------
 // resource loading / encoding helpers
@@ -51,8 +60,16 @@ static std::wstring Utf8ToWide(const std::string& s) {
     return w;
 }
 
-// Escape UTF-8 markdown text into the body of a JSON string literal (quotes
-// excluded), widened for ICoreWebView2::ExecuteScript.
+static std::string WideToUtf8(const std::wstring& w) {
+    if (w.empty()) return std::string();
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return std::string();
+    std::string s((size_t)n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), &s[0], n, nullptr, nullptr);
+    return s;
+}
+
+// Escape UTF-8 text into the body of a JSON string literal (quotes excluded).
 static std::wstring JsonEscapeToWide(const std::string& utf8) {
     static const char* kHex = "0123456789abcdef";
     std::string esc;
@@ -89,15 +106,65 @@ static void ReplaceAll(std::string& s, const std::string& token, const std::stri
     }
 }
 
-static std::wstring BuildBootstrapHtml() {
+// ---------------------------------------------------------------------------
+// asset extraction: mermaid/hljs/marked are too large for one NavigateToString,
+// so they are written next to the WebView2 cache and served via nppmdp.local
+// ---------------------------------------------------------------------------
+
+static std::wstring AssetsDir() {
+    wchar_t localAppData[MAX_PATH] = {};
+    GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH);
+    std::wstring dir = std::wstring(localAppData) + L"\\NppMarkdownPreview\\assets";
+    return dir;
+}
+
+static bool WriteAsset(const std::wstring& dir, const wchar_t* name, const std::string& data) {
+    if (data.empty()) return false;
+    std::wstring path = dir + L"\\" + name;
+    // Skip rewrite when the size already matches (fast path across launches).
+    WIN32_FILE_ATTRIBUTE_DATA fad = {};
+    if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) {
+        ULONGLONG existing = ((ULONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+        if (existing == data.size()) return true;
+    }
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    BOOL ok = WriteFile(h, data.data(), (DWORD)data.size(), &written, nullptr);
+    CloseHandle(h);
+    return ok && written == data.size();
+}
+
+static void ExtractAssets() {
+    std::wstring base = AssetsDir();
+    std::wstring parent = base.substr(0, base.find_last_of(L'\\'));
+    CreateDirectoryW(parent.c_str(), nullptr);   // WebView2 creates the leaf but not parents
+    CreateDirectoryW(base.c_str(), nullptr);
+
+    struct Asset { const wchar_t* name; UINT id; };
+    const Asset assets[] = {
+        { L"marked.umd.js",        IDR_MARKED_JS },
+        { L"highlight.min.js",     IDR_HIGHLIGHT_JS },
+        { L"github.min.css",       IDR_HLJS_LIGHT_CSS },
+        { L"github-dark.min.css",  IDR_HLJS_DARK_CSS },
+        { L"mermaid.min.js",       IDR_MERMAID_JS },
+    };
+    for (const auto& a : assets) {
+        std::string data = LoadRes(a.id);
+        bool ok = WriteAsset(base, a.name, data);
+        WvLog(L"Asset %s: %u bytes written=%d", a.name, (unsigned)data.size(), ok ? 1 : 0);
+    }
+    wv2::g_assetsDir = base;
+}
+
+static void BuildPreviewPage() {
     std::string html = LoadRes(IDR_PREVIEW_HTML);
     std::string css = LoadRes(IDR_STYLE_CSS);
-    std::string marked = LoadRes(IDR_MARKED_JS);
-    WvLog(L"Resources: html=%u css=%u marked=%u",
-          (unsigned)html.size(), (unsigned)css.size(), (unsigned)marked.size());
-    ReplaceAll(html, "__PLUGIN_MARKED__", marked);
+    WvLog(L"Resources: html=%u css=%u", (unsigned)html.size(), (unsigned)css.size());
     ReplaceAll(html, "__PLUGIN_CSS__", css);
-    return Utf8ToWide(html);
+    // Served from the asset host so the page is same-origin with its scripts.
+    WriteAsset(wv2::g_assetsDir, L"preview.html", html);
 }
 
 // ---------------------------------------------------------------------------
@@ -111,15 +178,23 @@ static bool IsMarkdownPath(const wchar_t* path) {
             _wcsicmp(ext, L".mdown") == 0 || _wcsicmp(ext, L".mkd") == 0);
 }
 
-static bool GetCurrentMarkdown(std::string& out) {
-    wchar_t path[MAX_PATH] = {};
-    SendMessageW(g_npp._nppHandle, NPPM_GETFULLCURRENTPATH, (WPARAM)MAX_PATH, (LPARAM)path);
-    if (!IsMarkdownPath(path)) return false;
-
+static HWND CurrentScintilla() {
     int which = 0;
     SendMessageW(g_npp._nppHandle, NPPM_GETCURRENTSCINTILLA, 0, (LPARAM)&which);
-    HWND sci = (which == 1) ? g_npp._scintillaSecondHandle : g_npp._scintillaMainHandle;
+    return (which == 1) ? g_npp._scintillaSecondHandle : g_npp._scintillaMainHandle;
+}
 
+static std::wstring CurrentPath() {
+    wchar_t path[MAX_PATH] = {};
+    SendMessageW(g_npp._nppHandle, NPPM_GETFULLCURRENTPATH, (WPARAM)MAX_PATH, (LPARAM)path);
+    return path;
+}
+
+static bool GetCurrentMarkdown(std::string& out) {
+    std::wstring path = CurrentPath();
+    if (!IsMarkdownPath(path.c_str())) return false;
+
+    HWND sci = CurrentScintilla();
     LRESULT len = SendMessageW(sci, SCI_GETLENGTH, 0, 0);
     if (len <= 0) {
         out.clear();
@@ -169,6 +244,35 @@ void OnWebViewReady() {
     RenderNow();
 }
 
+// preview -> editor: called from the WebView2 web-message handler
+void OnPreviewScroll(int docLine) {
+    if (!g_panel || !IsWindowVisible(g_panel)) return;
+    if (!IsMarkdownPath(CurrentPath().c_str())) return;
+    HWND sci = CurrentScintilla();
+    // avoid echoing right back while the editor is the one scrolling
+    if (GetTickCount() - g_lastEditorScrollTick < 200) return;
+    int shown = (int)SendMessageW(sci, SCI_VISIBLEFROMDOCLINE, (WPARAM)docLine, 0);
+    if (shown < 0) return;
+    g_syncingFromPreview = true;
+    SendMessageW(sci, SCI_SETFIRSTVISIBLELINE, (WPARAM)shown, 0);
+    g_syncingFromPreview = false;
+}
+
+// editor -> preview
+static void SyncEditorToPreview() {
+    if (g_syncingFromPreview) return;
+    if (!g_panel || !IsWindowVisible(g_panel) || !wv2::IsReady()) return;
+    if (!IsMarkdownPath(CurrentPath().c_str())) return;
+    HWND sci = CurrentScintilla();
+    int firstShown = (int)SendMessageW(sci, SCI_GETFIRSTVISIBLELINE, 0, 0);
+    int docLine = (int)SendMessageW(sci, SCI_DOCLINEFROMVISIBLE, (WPARAM)firstShown, 0);
+    if (docLine < 0) return;
+    g_lastEditorScrollTick = GetTickCount();
+    wchar_t js[128];
+    swprintf_s(js, L"window.__scrollToLine(%d);", docLine);
+    wv2::ExecScript(js);
+}
+
 // ---------------------------------------------------------------------------
 // dockable panel
 // ---------------------------------------------------------------------------
@@ -176,7 +280,9 @@ void OnWebViewReady() {
 static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE:
-            wv2::Init(hwnd, BuildBootstrapHtml());
+            ExtractAssets();
+            BuildPreviewPage();
+            wv2::Init(hwnd, std::wstring(), L"http://nppmdp.local/preview.html");
             return 0;
         case WM_SIZE: {
             RECT rc = {};
@@ -188,6 +294,9 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
             if (wParam == TIMER_RENDER) {
                 KillTimer(hwnd, TIMER_RENDER);
                 RenderNow();
+            } else if (wParam == TIMER_SCROLLSYNC) {
+                KillTimer(hwnd, TIMER_SCROLLSYNC);
+                SyncEditorToPreview();
             }
             return 0;
         case WM_ERASEBKGND:
@@ -227,6 +336,143 @@ static void EnsurePanel() {
 }
 
 // ---------------------------------------------------------------------------
+// file dialogs / export
+// ---------------------------------------------------------------------------
+
+static bool AskSavePath(const wchar_t* filter, const wchar_t* defExt,
+                        const std::wstring& initialName, std::wstring& out) {
+    wchar_t buf[MAX_PATH] = {};
+    if (!initialName.empty()) wcsncpy_s(buf, initialName.c_str(), _TRUNCATE);
+
+    OPENFILENAMEW ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_npp._nppHandle;
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile = buf;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrDefExt = defExt;
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetSaveFileNameW(&ofn)) return false;
+    out = buf;
+    return true;
+}
+
+static std::wstring BaseNameNoExt() {
+    std::wstring path = CurrentPath();
+    size_t slash = path.find_last_of(L"\\/");
+    std::wstring name = (slash == std::wstring::npos) ? path : path.substr(slash + 1);
+    size_t dot = name.find_last_of(L'.');
+    if (dot != std::wstring::npos) name.resize(dot);
+    return name.empty() ? L"document" : name;
+}
+
+static void WriteFileUtf8(const std::wstring& path, const std::string& utf8) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    // strip UTF-8 BOM
+    const char* p = utf8.data();
+    DWORD n = (DWORD)utf8.size();
+    if (n >= 3 && (unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) {
+        p += 3;
+        n -= 3;
+    }
+    DWORD written = 0;
+    WriteFile(h, p, n, &written, nullptr);
+    CloseHandle(h);
+}
+
+static void cmdExportHtml() {
+    if (!wv2::IsReady()) {
+        MessageBoxW(g_npp._nppHandle, L"Open the Markdown preview first.", L"NppMarkdownPreview",
+                    MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    std::wstring json;
+    if (!wv2::ExecScriptSync(L"window.__getHtml()", json) || json.size() < 2) {
+        MessageBoxW(g_npp._nppHandle, L"Nothing to export (no rendered content).", L"NppMarkdownPreview",
+                    MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    // ExecuteScript returns a JSON-encoded string literal; unescape it.
+    std::wstring body;
+    for (size_t i = 1; i + 1 < json.size(); ++i) {
+        wchar_t c = json[i];
+        if (c == L'\\' && i + 2 < json.size()) {
+            wchar_t e = json[++i];
+            switch (e) {
+                case L'n': body += L'\n'; break;
+                case L'r': body += L'\r'; break;
+                case L't': body += L'\t'; break;
+                case L'b': body += L'\b'; break;
+                case L'f': body += L'\f'; break;
+                case L'u':
+                    if (i + 4 < json.size()) {
+                        wchar_t hex[5] = { json[i+1], json[i+2], json[i+3], json[i+4], 0 };
+                        body += (wchar_t)wcstoul(hex, nullptr, 16);
+                        i += 4;
+                    }
+                    break;
+                default: body += e;
+            }
+        } else {
+            body += c;
+        }
+    }
+    if (body.empty()) {
+        MessageBoxW(g_npp._nppHandle, L"Nothing to export (no rendered content).", L"NppMarkdownPreview",
+                    MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    std::wstring outPath;
+    std::wstring defaultName = BaseNameNoExt() + L".html";
+    if (!AskSavePath(L"HTML Files (*.html)\0*.html\0All Files (*.*)\0*.*\0", L"html", defaultName, outPath))
+        return;
+
+    std::string css = LoadRes(IDR_STYLE_CSS);
+    std::string hljsLight = LoadRes(IDR_HLJS_LIGHT_CSS);
+    std::string hljsDark = LoadRes(IDR_HLJS_DARK_CSS);
+    std::string mermaid = LoadRes(IDR_MERMAID_JS);
+
+    std::string doc;
+    doc += "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n";
+    doc += "<title>" + WideToUtf8(BaseNameNoExt()) + "</title>\n";
+    doc += "<style>\n" + css + "\n</style>\n";
+    doc += "<style media=\"(prefers-color-scheme: light)\">\n" + hljsLight + "\n</style>\n";
+    doc += "<style media=\"(prefers-color-scheme: dark)\">\n" + hljsDark + "\n</style>\n";
+    doc += "</head>\n<body>\n<article class=\"content\">\n";
+    doc += WideToUtf8(body);
+    doc += "\n</article>\n";
+    // re-run mermaid on the exported copy so diagrams render without JS tooling
+    doc += "<script>\n" + mermaid + "\n</script>\n";
+    doc += "<script>\n"
+           "if(window.mermaid){try{mermaid.initialize({startOnLoad:true,securityLevel:'strict',"
+           "theme:matchMedia('(prefers-color-scheme: dark)').matches?'dark':'default'});}catch(e){}}\n"
+           "</script>\n</body>\n</html>\n";
+
+    WriteFileUtf8(outPath, doc);
+    MessageBoxW(g_npp._nppHandle, (L"HTML exported:\n" + outPath).c_str(), L"NppMarkdownPreview",
+                MB_OK | MB_ICONINFORMATION);
+}
+
+static void cmdExportPdf() {
+    if (!wv2::IsReady()) {
+        MessageBoxW(g_npp._nppHandle, L"Open the Markdown preview first.", L"NppMarkdownPreview",
+                    MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    std::wstring outPath;
+    std::wstring defaultName = BaseNameNoExt() + L".pdf";
+    if (!AskSavePath(L"PDF Files (*.pdf)\0*.pdf\0All Files (*.*)\0*.*\0", L"pdf", defaultName, outPath))
+        return;
+    if (!wv2::PrintToPdf(g_npp._nppHandle, outPath)) {
+        MessageBoxW(g_npp._nppHandle, L"PDF export could not be started.", L"NppMarkdownPreview",
+                    MB_OK | MB_ICONWARNING);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // menu commands
 // ---------------------------------------------------------------------------
 
@@ -251,22 +497,43 @@ static void cmdRefreshPreview() {
     RenderNow();
 }
 
+static void cmdZoomIn()  { wv2::ZoomBy(1.1); }
+static void cmdZoomOut() { wv2::ZoomBy(1.0 / 1.1); }
+static void cmdZoomReset() { wv2::ZoomReset(); }
+
 static void cmdAbout() {
     MessageBoxW(g_npp._nppHandle,
-                L"NppMarkdownPreview 1.0.0\r\n\r\n"
+                L"NppMarkdownPreview 1.1.0\r\n\r\n"
                 L"Native ARM64 / x64 Markdown preview for Notepad++.\r\n"
-                L"Rendering: WebView2 (Edge) + marked.js\r\n\r\n"
-                L"Plugin: GPLv3   |   marked.js: MIT",
+                L"Rendering: WebView2 (Edge) + marked.js\r\n"
+                L"Code highlighting: highlight.js\r\n"
+                L"Diagrams: Mermaid\r\n"
+                L"Features: live preview, two-way scroll sync,\r\n"
+                L"          zoom, export HTML/PDF\r\n\r\n"
+                L"Plugin: GPLv3   |   marked/hljs/mermaid: MIT",
                 L"NppMarkdownPreview", MB_OK | MB_ICONINFORMATION);
 }
 
 static void InitFuncItems() {
-    wcscpy_s(g_funcItems[0]._itemName, L"Toggle Markdown Preview");
-    g_funcItems[0]._pFunc = cmdTogglePreview;
-    wcscpy_s(g_funcItems[1]._itemName, L"Refresh Preview");
-    g_funcItems[1]._pFunc = cmdRefreshPreview;
-    wcscpy_s(g_funcItems[2]._itemName, L"About...");
-    g_funcItems[2]._pFunc = cmdAbout;
+    const wchar_t* names[8] = {
+        L"Toggle Markdown Preview",
+        L"Refresh Preview",
+        L"Zoom In\tCtrl+Alt+=",
+        L"Zoom Out\tCtrl+Alt+-",
+        L"Zoom Reset\tCtrl+Alt+0",
+        L"Export HTML...",
+        L"Export PDF...",
+        L"About...",
+    };
+    PFUNCPLUGINCMD funcs[8] = {
+        cmdTogglePreview, cmdRefreshPreview,
+        cmdZoomIn, cmdZoomOut, cmdZoomReset,
+        cmdExportHtml, cmdExportPdf, cmdAbout,
+    };
+    for (int i = 0; i < 8; ++i) {
+        wcscpy_s(g_funcItems[i]._itemName, names[i]);
+        g_funcItems[i]._pFunc = funcs[i];
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -283,7 +550,7 @@ extern "C" __declspec(dllexport) const wchar_t* getName() {
 
 extern "C" __declspec(dllexport) FuncItem* getFuncsArray(int* nbFuncItem) {
     if (!nbFuncItem) return nullptr;
-    *nbFuncItem = 3;
+    *nbFuncItem = 8;
     return g_funcItems;
 }
 
@@ -297,6 +564,8 @@ extern "C" __declspec(dllexport) void beNotified(SCNotification* scn) {
         case SCN_UPDATEUI:
             if (scn->updated & SC_UPDATE_CONTENT)
                 ScheduleRefresh();
+            if ((scn->updated & SC_UPDATE_V_SCROLL) && g_panel && IsWindowVisible(g_panel))
+                SetTimer(g_panel, TIMER_SCROLLSYNC, 60, nullptr);
             break;
         case NPPN_SHUTDOWN:
             if (g_panelCreated) DestroyWindow(g_panel);
