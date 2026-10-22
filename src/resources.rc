@@ -1,0 +1,30 @@
+#include <windows.h>
+#include "resource.h"
+
+IDR_MARKED_JS    RCDATA "marked.umd.js"
+IDR_STYLE_CSS    RCDATA "style.css"
+IDR_PREVIEW_HTML RCDATA "preview.html"
+
+1 VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+FILEOS 0x40004
+FILETYPE 0x2
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription", "NppMarkdownPreview - native markdown preview plugin for Notepad++"
+            VALUE "FileVersion", "1.0.0.0"
+            VALUE "InternalName", "NppMarkdownPreview"
+            VALUE "OriginalFilename", "NppMarkdownPreview.dll"
+            VALUE "ProductName", "NppMarkdownPreview"
+            VALUE "ProductVersion", "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
