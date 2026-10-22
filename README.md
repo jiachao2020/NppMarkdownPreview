@@ -5,7 +5,12 @@ Notepad++ 的**原生** Markdown 预览插件（C++ / Win32 / WebView2，无 .NE
 在停靠面板中实时渲染当前 Markdown 缓冲区：
 
 - WebView2（Edge 内核）渲染 + marked.js 解析
-- 切换文件、保存、输入时自动刷新（约 0.4 秒防抖）
+- **代码块语法高亮**（highlight.js，GitHub 明暗两套配色）
+- **Mermaid 图表**（流程图 / 时序图 / 甘特图等）
+- **双向滚动同步**：编辑器滚到哪，预览跟到哪；反之亦然（基于源码行号锚点）
+- **导出 HTML**（单文件，样式 + 图表自带）与 **导出 PDF**（WebView2 打印引擎）
+- **预览缩放**：Ctrl+Alt+= / Ctrl+Alt+- / Ctrl+Alt+0
+- 链接在系统浏览器打开；切换文件、保存、输入时自动刷新（约 0.4 秒防抖）
 - 深浅色主题自动跟随系统（`prefers-color-scheme`）
 
 ## 云端编译（GitHub Actions，免费，无需本机安装任何工具链）
