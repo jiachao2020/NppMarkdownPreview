@@ -1,0 +1,53 @@
+name: Build plugin
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Build ARM64
+        run: msbuild src\NppMarkdownPreview.vcxproj /restore /m /p:Configuration=Release /p:Platform=ARM64
+
+      - name: Build x64
+        run: msbuild src\NppMarkdownPreview.vcxproj /restore /m /p:Configuration=Release /p:Platform=x64
+
+      - name: Package
+        shell: pwsh
+        run: |
+          foreach ($arch in @("ARM64", "x64")) {
+            $dir = "package\$arch\NppMarkdownPreview"
+            New-Item -ItemType Directory -Force $dir | Out-Null
+            Copy-Item "src\$arch\Release\NppMarkdownPreview.dll" $dir -Force
+            $rid = "win-$($arch.ToLower())"
+            $loader = Get-ChildItem "$env:USERPROFILE\.nuget\packages\microsoft.web.webview2" -Recurse -Filter WebView2Loader.dll |
+                      Where-Object { $_.FullName -match $rid } | Select-Object -First 1
+            if ($loader) { Copy-Item $loader.FullName $dir -Force }
+            Compress-Archive -Path $dir -DestinationPath "package\NppMarkdownPreview-$arch.zip" -Force
+          }
+          Get-ChildItem package
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: NppMarkdownPreview-plugin
+          path: package/NppMarkdownPreview-*.zip
+
+      - name: Create release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-$env:GITHUB_RUN_NUMBER" --title "Build $env:GITHUB_RUN_NUMBER" --latest package/NppMarkdownPreview-ARM64.zip package/NppMarkdownPreview-x64.zip
