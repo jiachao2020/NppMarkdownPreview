@@ -6,10 +6,35 @@
 
 #include <windows.h>
 #include <string>
+#include <cstdarg>
 #include <wrl/client.h>
 #include "WebView2.h"
 
 using Microsoft::WRL::ComPtr;
+
+// Append-only trace log at %LOCALAPPDATA%\NppMarkdownPreview\debug.log (UTF-16LE).
+inline void WvLog(const wchar_t* fmt, ...) {
+    SYSTEMTIME st = {};
+    GetLocalTime(&st);
+    wchar_t ts[40];
+    swprintf_s(ts, L"[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    wchar_t msg[2048];
+    va_list args;
+    va_start(args, fmt);
+    _vsnwprintf_s(msg, _TRUNCATE, fmt, args);
+    va_end(args);
+    wchar_t dir[MAX_PATH] = {};
+    GetEnvironmentVariableW(L"LOCALAPPDATA", dir, MAX_PATH);
+    std::wstring path = std::wstring(dir) + L"\\NppMarkdownPreview\\debug.log";
+    HANDLE h = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ,
+                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    WriteFile(h, ts, (DWORD)(wcslen(ts) * sizeof(wchar_t)), &written, nullptr);
+    WriteFile(h, msg, (DWORD)(wcslen(msg) * sizeof(wchar_t)), &written, nullptr);
+    WriteFile(h, L"\r\n", 4, &written, nullptr);
+    CloseHandle(h);
+}
 
 extern HINSTANCE g_hInst;   // defined in NppMarkdownPreview.cpp
 void OnWebViewReady();      // implemented in NppMarkdownPreview.cpp
@@ -53,7 +78,10 @@ inline std::wstring HexCode(HRESULT hr) {
 class NavHandler final : public RefCounted<ICoreWebView2NavigationCompletedEventHandler> {
 public:
     HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2* /*sender*/,
-                                     ICoreWebView2NavigationCompletedEventArgs* /*args*/) override {
+                                     ICoreWebView2NavigationCompletedEventArgs* args) override {
+        BOOL ok = FALSE;
+        if (args) args->get_IsSuccess(&ok);
+        WvLog(L"NavigationCompleted: success=%d", (int)ok);
         g_ready = true;
         OnWebViewReady();
         return S_OK;
@@ -84,14 +112,21 @@ public:
         if (FAILED(g_controller->get_CoreWebView2(&g_webview)) || !g_webview) return S_OK;
 
         RECT rc = {};
-        if (parent && GetClientRect(parent, &rc)) {
+        bool hasRc = (parent && GetClientRect(parent, &rc));
+        WvLog(L"Controller created: rect=(%ld,%ld,%ld,%ld)", rc.left, rc.top, rc.right, rc.bottom);
+        if (hasRc) {
             g_controller->put_Bounds(rc);
         }
 
         EventRegistrationToken navToken = {};
         ComPtr<NavHandler> nav(new NavHandler());
         g_webview->add_NavigationCompleted(nav.Get(), &navToken);
-        g_webview->NavigateToString(html.c_str());
+        HRESULT navHr = g_webview->NavigateToString(html.c_str());
+        WvLog(L"NavigateToString: hr=0x%s htmlLen=%u", HexCode(navHr).c_str(), (unsigned)html.size());
+        if (FAILED(navHr)) {
+            MessageBoxW(parent, (L"NavigateToString failed.\nHRESULT: 0x" + HexCode(navHr)).c_str(),
+                        L"NppMarkdownPreview", MB_OK | MB_ICONWARNING);
+        }
         return S_OK;
     }
 };
@@ -111,6 +146,7 @@ public:
             return S_OK;
         }
         g_env = createdEnvironment;
+        WvLog(L"Environment created OK");
         auto* ch = new ControllerHandler();
         ch->parent = parent;
         ch->html = html;
@@ -139,6 +175,7 @@ inline bool Init(HWND parent, const std::wstring& bootstrapHtml) {
     loader += L"WebView2Loader.dll";
     g_loader = LoadLibraryW(loader.c_str());
     if (!g_loader) g_loader = LoadLibraryW(L"WebView2Loader.dll");
+    WvLog(L"Init: loader='%s' loaded=%d", loader.c_str(), g_loader ? 1 : 0);
     if (!g_loader) {
         MessageBoxW(parent, L"WebView2Loader.dll was not found next to NppMarkdownPreview.dll.",
                     L"NppMarkdownPreview", MB_OK | MB_ICONWARNING);
@@ -160,6 +197,7 @@ inline bool Init(HWND parent, const std::wstring& bootstrapHtml) {
     eh->html = bootstrapHtml;
     HRESULT hr = create(nullptr, userData.c_str(), nullptr, eh);
     eh->Release();
+    WvLog(L"Init: CreateEnvironment hr=0x%s userData='%s'", HexCode(hr).c_str(), userData.c_str());
     if (FAILED(hr)) {
         MessageBoxW(parent,
                     (L"CreateCoreWebView2Environment failed immediately.\nHRESULT: 0x" + HexCode(hr)).c_str(),
@@ -180,6 +218,7 @@ inline bool ExecScript(const std::wstring& js) {
     auto* h = new ExecHandler();
     HRESULT hr = g_webview->ExecuteScript(js.c_str(), h);
     h->Release();
+    if (FAILED(hr)) WvLog(L"ExecuteScript: hr=0x%s len=%u", HexCode(hr).c_str(), (unsigned)js.size());
     return SUCCEEDED(hr);
 }
 
