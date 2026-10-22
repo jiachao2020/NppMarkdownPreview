@@ -134,16 +134,25 @@ public:
 };
 
 // open external http(s) links in the system browser, keep nppmdp.local internal
+inline bool IsInternalUrl(const wchar_t* uri) {
+    static const wchar_t* kBase = L"http://nppmdp.local/";
+    return wcsncmp(uri, kBase, wcslen(kBase)) == 0;
+}
+
 class NavStartingHandler final : public RefCounted<ICoreWebView2NavigationStartingEventHandler> {
 public:
     HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2* /*sender*/,
                                      ICoreWebView2NavigationStartingEventArgs* args) override {
         PWSTR uri = nullptr;
         if (SUCCEEDED(args->get_Uri(&uri)) && uri) {
-            if ((wcsncmp(uri, L"http://", 7) == 0 || wcsncmp(uri, L"https://", 8) == 0) &&
-                wcsncmp(uri, L"http://nppmdp.local/", 21) != 0) {
+            bool external = (wcsncmp(uri, L"http://", 7) == 0 || wcsncmp(uri, L"https://", 8) == 0) &&
+                            !IsInternalUrl(uri);
+            if (external) {
+                WvLog(L"External link -> browser: %s", uri);
                 ShellExecuteW(nullptr, L"open", uri, nullptr, nullptr, SW_SHOWNORMAL);
                 args->put_Cancel(TRUE);
+            } else {
+                WvLog(L"In-page navigation: %s", uri);
             }
             CoTaskMemFree(uri);
         }
