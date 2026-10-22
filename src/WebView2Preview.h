@@ -1,16 +1,32 @@
-// WebView2Preview.h - minimal WebView2 bootstrap for the preview panel.
-// No ATL/MFC required; interface calls go through the vtable only and the
-// loader DLL is resolved with LoadLibrary + GetProcAddress, so nothing from
-// WebView2Loader.lib needs to be linked.
+// WebView2Preview.h - WebView2 layer for the preview panel.
+// No ATL/MFC; interface calls go through vtables only and WebView2Loader.dll
+// is resolved with LoadLibrary + GetProcAddress (nothing from WebView2Loader.lib
+// needs to be linked). Assets (marked/hljs/mermaid) are extracted to disk and
+// served through the virtual host http://nppmdp.local/.
 #pragma once
 
 #include <windows.h>
+#include <shellapi.h>
 #include <string>
 #include <cstdarg>
 #include <wrl/client.h>
 #include "WebView2.h"
 
+#pragma comment(lib, "shell32.lib")
+
 using Microsoft::WRL::ComPtr;
+
+extern HINSTANCE g_hInst;   // defined in NppMarkdownPreview.cpp
+void OnWebViewReady();      // implemented in NppMarkdownPreview.cpp
+void OnPreviewScroll(int docLine);  // implemented in NppMarkdownPreview.cpp
+
+namespace wv2 {
+
+inline ComPtr<ICoreWebView2Environment> g_env;
+inline ComPtr<ICoreWebView2Controller> g_controller;
+inline ComPtr<ICoreWebView2> g_webview;
+inline bool g_ready = false;
+inline std::wstring g_assetsDir;   // set by the plugin before Init()
 
 // Append-only trace log at %LOCALAPPDATA%\NppMarkdownPreview\debug.log (UTF-16LE).
 inline void WvLog(const wchar_t* fmt, ...) {
@@ -36,15 +52,11 @@ inline void WvLog(const wchar_t* fmt, ...) {
     CloseHandle(h);
 }
 
-extern HINSTANCE g_hInst;   // defined in NppMarkdownPreview.cpp
-void OnWebViewReady();      // implemented in NppMarkdownPreview.cpp
-
-namespace wv2 {
-
-inline ComPtr<ICoreWebView2Environment> g_env;
-inline ComPtr<ICoreWebView2Controller> g_controller;
-inline ComPtr<ICoreWebView2> g_webview;
-inline bool g_ready = false;
+inline std::wstring HexCode(HRESULT hr) {
+    wchar_t buf[16];
+    swprintf_s(buf, L"%08X", (unsigned)hr);
+    return buf;
+}
 
 // Simple reference-counted base for the COM callback handlers.
 template <typename I>
@@ -69,12 +81,6 @@ public:
     }
 };
 
-inline std::wstring HexCode(HRESULT hr) {
-    wchar_t buf[16];
-    swprintf_s(buf, L"%08X", (unsigned)hr);
-    return buf;
-}
-
 class NavHandler final : public RefCounted<ICoreWebView2NavigationCompletedEventHandler> {
 public:
     HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2* /*sender*/,
@@ -96,10 +102,74 @@ public:
     }
 };
 
+// ExecuteScript with captured result + event wait (message-pumped on the UI thread).
+class ExecCaptureHandler final : public RefCounted<ICoreWebView2ExecuteScriptCompletedHandler> {
+public:
+    HANDLE done = nullptr;
+    bool ok = false;
+    std::wstring result;
+    HRESULT STDMETHODCALLTYPE Invoke(HRESULT errorCode, LPCWSTR jsonResult) override {
+        ok = SUCCEEDED(errorCode);
+        if (jsonResult) result = jsonResult;
+        if (done) SetEvent(done);
+        return S_OK;
+    }
+};
+
+// page scroll message: "scroll:<docLine>"
+class WebMessageHandler final : public RefCounted<ICoreWebView2WebMessageReceivedEventHandler> {
+public:
+    HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2* /*sender*/,
+                                     ICoreWebView2WebMessageReceivedEventArgs* args) override {
+        PWSTR msg = nullptr;
+        if (SUCCEEDED(args->TryGetWebMessageAsString(&msg)) && msg) {
+            if (wcsncmp(msg, L"scroll:", 7) == 0) {
+                int line = _wtoi(msg + 7);
+                if (line >= 0) OnPreviewScroll(line);
+            }
+            CoTaskMemFree(msg);
+        }
+        return S_OK;
+    }
+};
+
+// open external http(s) links in the system browser, keep nppmdp.local internal
+class NavStartingHandler final : public RefCounted<ICoreWebView2NavigationStartingEventHandler> {
+public:
+    HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2* /*sender*/,
+                                     ICoreWebView2NavigationStartingEventArgs* args) override {
+        PWSTR uri = nullptr;
+        if (SUCCEEDED(args->get_Uri(&uri)) && uri) {
+            if ((wcsncmp(uri, L"http://", 7) == 0 || wcsncmp(uri, L"https://", 8) == 0) &&
+                wcsncmp(uri, L"http://nppmdp.local/", 21) != 0) {
+                ShellExecuteW(nullptr, L"open", uri, nullptr, nullptr, SW_SHOWNORMAL);
+                args->put_Cancel(TRUE);
+            }
+            CoTaskMemFree(uri);
+        }
+        return S_OK;
+    }
+};
+
+class NewWindowHandler final : public RefCounted<ICoreWebView2NewWindowRequestedEventHandler> {
+public:
+    HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2* /*sender*/,
+                                     ICoreWebView2NewWindowRequestedEventArgs* args) override {
+        PWSTR uri = nullptr;
+        if (SUCCEEDED(args->get_Uri(&uri)) && uri) {
+            ShellExecuteW(nullptr, L"open", uri, nullptr, nullptr, SW_SHOWNORMAL);
+            CoTaskMemFree(uri);
+        }
+        args->put_Handled(TRUE);
+        return S_OK;
+    }
+};
+
 class ControllerHandler final : public RefCounted<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler> {
 public:
     HWND parent = nullptr;
-    std::wstring html;
+    std::wstring html;   // inline HTML (used when url is empty)
+    std::wstring url;    // preferred: navigate to this URL (same-origin with the asset host)
 
     HRESULT STDMETHODCALLTYPE Invoke(HRESULT errorCode, ICoreWebView2Controller* createdController) override {
         if (FAILED(errorCode) || !createdController) {
@@ -118,13 +188,32 @@ public:
             g_controller->put_Bounds(rc);
         }
 
-        EventRegistrationToken navToken = {};
+        // serve assets from disk through http://nppmdp.local/
+        ComPtr<ICoreWebView2_3> wv3;
+        if (!g_assetsDir.empty() && SUCCEEDED(g_webview.As(&wv3)) && wv3) {
+            HRESULT mhr = wv3->SetVirtualHostNameToFolderMapping(
+                L"nppmdp.local", g_assetsDir.c_str(), COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_ALLOW);
+            WvLog(L"VirtualHostMapping: hr=0x%s dir=%s", HexCode(mhr).c_str(), g_assetsDir.c_str());
+        }
+
+        EventRegistrationToken tok = {};
+        g_webview->add_WebMessageReceived(new WebMessageHandler(), &tok);
+        g_webview->add_NavigationStarting(new NavStartingHandler(), &tok);
+        g_webview->add_NewWindowRequested(new NewWindowHandler(), &tok);
+
         ComPtr<NavHandler> nav(new NavHandler());
+        EventRegistrationToken navToken = {};
         g_webview->add_NavigationCompleted(nav.Get(), &navToken);
-        HRESULT navHr = g_webview->NavigateToString(html.c_str());
-        WvLog(L"NavigateToString: hr=0x%s htmlLen=%u", HexCode(navHr).c_str(), (unsigned)html.size());
+        HRESULT navHr;
+        if (!url.empty()) {
+            navHr = g_webview->Navigate(url.c_str());
+            WvLog(L"Navigate: hr=0x%s url=%s", HexCode(navHr).c_str(), url.c_str());
+        } else {
+            navHr = g_webview->NavigateToString(html.c_str());
+            WvLog(L"NavigateToString: hr=0x%s htmlLen=%u", HexCode(navHr).c_str(), (unsigned)html.size());
+        }
         if (FAILED(navHr)) {
-            MessageBoxW(parent, (L"NavigateToString failed.\nHRESULT: 0x" + HexCode(navHr)).c_str(),
+            MessageBoxW(parent, (L"Navigation failed.\nHRESULT: 0x" + HexCode(navHr)).c_str(),
                         L"NppMarkdownPreview", MB_OK | MB_ICONWARNING);
         }
         return S_OK;
@@ -135,6 +224,7 @@ class EnvironmentHandler final : public RefCounted<ICoreWebView2CreateCoreWebVie
 public:
     HWND parent = nullptr;
     std::wstring html;
+    std::wstring url;
 
     HRESULT STDMETHODCALLTYPE Invoke(HRESULT errorCode, ICoreWebView2Environment* createdEnvironment) override {
         if (FAILED(errorCode) || !createdEnvironment) {
@@ -150,8 +240,25 @@ public:
         auto* ch = new ControllerHandler();
         ch->parent = parent;
         ch->html = html;
+        ch->url = url;
         createdEnvironment->CreateCoreWebView2Controller(parent, ch);
         ch->Release();
+        return S_OK;
+    }
+};
+
+// ---- PDF export ----
+class PrintPdfHandler final : public RefCounted<ICoreWebView2PrintToPdfCompletedHandler> {
+public:
+    HWND owner = nullptr;
+    std::wstring path;
+    HRESULT STDMETHODCALLTYPE Invoke(HRESULT errorCode, BOOL result) override {
+        if (SUCCEEDED(errorCode) && result) {
+            MessageBoxW(owner, (L"PDF saved:\n" + path).c_str(), L"NppMarkdownPreview", MB_OK | MB_ICONINFORMATION);
+        } else {
+            MessageBoxW(owner, (L"PDF export failed.\nHRESULT: 0x" + HexCode(errorCode)).c_str(),
+                        L"NppMarkdownPreview", MB_OK | MB_ICONWARNING);
+        }
         return S_OK;
     }
 };
@@ -163,7 +270,7 @@ typedef HRESULT(WINAPI* PFN_CreateCoreWebView2EnvironmentWithOptions)(
 
 inline HMODULE g_loader = nullptr;
 
-inline bool Init(HWND parent, const std::wstring& bootstrapHtml) {
+inline bool Init(HWND parent, const std::wstring& bootstrapHtml, const std::wstring& url = L"") {
     if (g_webview) return true;   // already initialized
 
     // WebView2Loader.dll is shipped next to this plugin DLL.
@@ -195,6 +302,7 @@ inline bool Init(HWND parent, const std::wstring& bootstrapHtml) {
     auto* eh = new EnvironmentHandler();
     eh->parent = parent;
     eh->html = bootstrapHtml;
+    eh->url = url;
     HRESULT hr = create(nullptr, userData.c_str(), nullptr, eh);
     eh->Release();
     WvLog(L"Init: CreateEnvironment hr=0x%s userData='%s'", HexCode(hr).c_str(), userData.c_str());
@@ -219,6 +327,68 @@ inline bool ExecScript(const std::wstring& js) {
     HRESULT hr = g_webview->ExecuteScript(js.c_str(), h);
     h->Release();
     if (FAILED(hr)) WvLog(L"ExecuteScript: hr=0x%s len=%u", HexCode(hr).c_str(), (unsigned)js.size());
+    return SUCCEEDED(hr);
+}
+
+// Run a script and synchronously capture its JSON-encoded result.
+inline bool ExecScriptSync(const std::wstring& js, std::wstring& jsonResult) {
+    if (!g_webview) return false;
+    auto* h = new ExecCaptureHandler();
+    h->done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HRESULT hr = g_webview->ExecuteScript(js.c_str(), h);
+    if (FAILED(hr)) {
+        CloseHandle(h->done);
+        h->Release();
+        WvLog(L"ExecScriptSync: hr=0x%s", HexCode(hr).c_str());
+        return false;
+    }
+    while (WaitForSingleObject(h->done, 50) == WAIT_TIMEOUT) {
+        MSG m;
+        while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+    }
+    bool ok = h->ok;
+    jsonResult = h->result;
+    CloseHandle(h->done);
+    h->Release();
+    return ok;
+}
+
+inline void ZoomBy(double factor) {
+    if (!g_controller) return;
+    double z = 1.0;
+    g_controller->get_ZoomFactor(&z);
+    z *= factor;
+    if (z < 0.25) z = 0.25;
+    if (z > 5.0) z = 5.0;
+    g_controller->put_ZoomFactor(z);
+}
+
+inline void ZoomReset() {
+    if (g_controller) g_controller->put_ZoomFactor(1.0);
+}
+
+inline bool PrintToPdf(HWND owner, const std::wstring& path) {
+    if (!g_webview) return false;
+    ComPtr<ICoreWebView2_7> wv7;
+    if (FAILED(g_webview.As(&wv7)) || !wv7) return false;
+    ComPtr<ICoreWebView2Environment6> env6;
+    if (FAILED(g_env.As(&env6)) || !env6) return false;
+    ComPtr<ICoreWebView2PrintSettings> settings;
+    if (FAILED(env6->CreatePrintSettings(&settings)) || !settings) return false;
+    settings->put_PageWidth(8.5);
+    settings->put_PageHeight(11.0);
+    settings->put_Orientation(COREWEBVIEW2_PRINT_ORIENTATION_PORTRAIT);
+    settings->put_ShouldPrintBackgrounds(TRUE);
+    settings->put_ShouldPrintHeaderAndFooter(FALSE);
+    auto* h = new PrintPdfHandler();
+    h->owner = owner;
+    h->path = path;
+    HRESULT hr = wv7->PrintToPdf(path.c_str(), settings.Get(), h);
+    h->Release();
+    WvLog(L"PrintToPdf: hr=0x%s path=%s", HexCode(hr).c_str(), path.c_str());
     return SUCCEEDED(hr);
 }
 
