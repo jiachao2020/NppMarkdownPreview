@@ -54,6 +54,7 @@
     <ClInclude Include="PluginInterface.h" />
     <ClInclude Include="resource.h" />
     <ClInclude Include="Scintilla.h" />
+    <ClInclude Include="Sci_Position.h" />
     <ClInclude Include="WebView2Preview.h" />
   </ItemGroup>
   <ItemGroup>
