@@ -17,6 +17,8 @@
 
 #pragma comment(lib, "comdlg32.lib")
 
+using wv2::WvLog;
+
 #define TIMER_RENDER      1
 #define TIMER_SCROLLSYNC  2
 #define MD_MAX_BYTES      (10 * 1024 * 1024)
