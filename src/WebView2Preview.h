@@ -56,8 +56,8 @@ public:
 
 class ExecHandler final : public RefCounted<ICoreWebView2ExecuteScriptCompletedHandler> {
 public:
-    HRESULT STDMETHODCALLTYPE Invoke(HRESULT /*errorCode*/,
-                                     ICoreWebView2ExecuteScriptCompletedEventArgs* /*args*/) override {
+    // SDK 1.0.4258.31: Invoke(HRESULT errorCode, LPCWSTR result)
+    HRESULT STDMETHODCALLTYPE Invoke(HRESULT /*errorCode*/, LPCWSTR /*result*/) override {
         return S_OK;
     }
 };
@@ -123,7 +123,8 @@ inline bool Init(HWND parent, const std::wstring& bootstrapHtml) {
     wchar_t selfPath[MAX_PATH] = {};
     GetModuleFileNameW(g_hInst, selfPath, MAX_PATH);
     const wchar_t* slash = wcsrchr(selfPath, L'\\');
-    std::wstring loader = slash ? std::wstring(selfPath, slash + 1) : std::wstring();
+    std::wstring loader(selfPath);
+    if (slash) loader.resize((size_t)(slash - selfPath) + 1);   // directory incl. trailing backslash
     loader += L"WebView2Loader.dll";
     g_loader = LoadLibraryW(loader.c_str());
     if (!g_loader) g_loader = LoadLibraryW(L"WebView2Loader.dll");
