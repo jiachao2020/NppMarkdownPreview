@@ -94,6 +94,8 @@ static std::wstring BuildBootstrapHtml() {
     std::string html = LoadRes(IDR_PREVIEW_HTML);
     std::string css = LoadRes(IDR_STYLE_CSS);
     std::string marked = LoadRes(IDR_MARKED_JS);
+    WvLog(L"Resources: html=%u css=%u marked=%u",
+          (unsigned)html.size(), (unsigned)css.size(), (unsigned)marked.size());
     ReplaceAll(html, "__PLUGIN_MARKED__", marked);
     ReplaceAll(html, "__PLUGIN_CSS__", css);
     return Utf8ToWide(html);
@@ -141,14 +143,19 @@ static void ScheduleRefresh() {
 }
 
 static void RenderNow() {
-    if (!wv2::IsReady()) return;
+    if (!wv2::IsReady()) {
+        WvLog(L"RenderNow skipped: webview not ready");
+        return;
+    }
 
     std::string md;
     if (GetCurrentMarkdown(md)) {
         g_hintShown = false;
         if (md == g_lastMarkdown) return;   // unchanged
         g_lastMarkdown = md;
-        wv2::ExecScript(L"window.__update(\"" + JsonEscapeToWide(md) + L"\");");
+        WvLog(L"RenderNow: rendering %u bytes", (unsigned)md.size());
+        bool ok = wv2::ExecScript(L"window.__update(\"" + JsonEscapeToWide(md) + L"\");");
+        WvLog(L"RenderNow: ExecuteScript %s", ok ? L"S_OK" : L"FAILED");
     } else {
         g_lastMarkdown.clear();
         if (!g_hintShown) {
@@ -225,7 +232,11 @@ static void EnsurePanel() {
 // ---------------------------------------------------------------------------
 
 static void cmdTogglePreview() {
-    EnsurePanel();
+    if (!g_panelCreated) {
+        EnsurePanel();        // create, register and show - no toggle on first call
+        ScheduleRefresh();
+        return;
+    }
     if (g_panelVisible) {
         SendMessageW(g_npp._nppHandle, NPPM_DMMHIDE, 0, (LPARAM)g_panel);
         g_panelVisible = false;
