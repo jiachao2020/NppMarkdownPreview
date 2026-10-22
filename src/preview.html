@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+__PLUGIN_CSS__
+</style>
+<script>
+__PLUGIN_MARKED__
+</script>
+</head>
+<body>
+<div id="__status" class="status" style="display:none"></div>
+<article id="__content" class="content"></article>
+<script>
+(function () {
+    'use strict';
+    var content = document.getElementById('__content');
+    var status = document.getElementById('__status');
+    window.__update = function (md) {
+        status.style.display = 'none';
+        content.style.display = 'block';
+        content.innerHTML = marked.parse(md);
+    };
+    window.__setStatus = function (text) {
+        content.style.display = 'none';
+        status.textContent = text;
+        status.style.display = 'block';
+    };
+})();
+</script>
+</body>
+</html>
