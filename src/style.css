@@ -15,6 +15,10 @@ img{max-width:100%}
 hr{height:.25em;background:#d0d7de;border:0;margin:24px 0}
 ul,ol{padding-left:2em}
 .status{color:#6e7781;font-style:italic;padding:32px 8px;font-size:14px}
+.mermaid{margin:16px 0;text-align:center;min-height:1em}
+input[type=checkbox]{margin:0 .5em .1em 0;vertical-align:middle}
+del{opacity:.75}
+iframe{border:1px solid #d0d7de;max-width:100%}
 @media (prefers-color-scheme:dark){
 body{color:#e6edf3;background:#0d1117}
 h1,h2{border-bottom-color:#30363d}
