@@ -11,23 +11,32 @@ __PLUGIN_MARKED__
 </script>
 </head>
 <body>
-<div id="__status" class="status" style="display:none"></div>
-<article id="__content" class="content"></article>
+<div id="__status" class="status">Loading preview...</div>
+<article id="__content" class="content" style="display:none"></article>
 <script>
 (function () {
     'use strict';
     var content = document.getElementById('__content');
     var status = document.getElementById('__status');
-    window.__update = function (md) {
-        status.style.display = 'none';
-        content.style.display = 'block';
-        content.innerHTML = marked.parse(md);
-    };
-    window.__setStatus = function (text) {
+    function fail(msg) {
         content.style.display = 'none';
-        status.textContent = text;
+        status.textContent = msg;
         status.style.display = 'block';
+    }
+    if (typeof marked === 'undefined') {
+        fail('marked.js failed to load');
+        return;
+    }
+    window.__update = function (md) {
+        try {
+            status.style.display = 'none';
+            content.style.display = 'block';
+            content.innerHTML = marked.parse(md);
+        } catch (e) {
+            fail('Render error: ' + (e && e.message ? e.message : String(e)));
+        }
     };
+    window.__setStatus = fail;
 })();
 </script>
 </body>
