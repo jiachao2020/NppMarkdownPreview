@@ -30,7 +30,10 @@ jobs:
           foreach ($arch in @("ARM64", "x64")) {
             $dir = "package\$arch\NppMarkdownPreview"
             New-Item -ItemType Directory -Force $dir | Out-Null
-            Copy-Item "src\$arch\Release\NppMarkdownPreview.dll" $dir -Force
+            $dll = Get-ChildItem "src" -Recurse -Filter "NppMarkdownPreview.dll" |
+                   Where-Object { $_.FullName -match "\\$arch\\" } | Select-Object -First 1
+            if (-not $dll) { throw "NppMarkdownPreview.dll not found for $arch" }
+            Copy-Item $dll.FullName $dir -Force
             $rid = "win-$($arch.ToLower())"
             $loader = Get-ChildItem "$env:USERPROFILE\.nuget\packages\microsoft.web.webview2" -Recurse -Filter WebView2Loader.dll |
                       Where-Object { $_.FullName -match $rid } | Select-Object -First 1
